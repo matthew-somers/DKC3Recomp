@@ -730,12 +730,13 @@ static uint16_t Dkc3ReadWram16(uint16_t address) {
  * 256-pixel placement index. A quick save made by an older build preserves
  * that native-width index, and changing aspect is host-only, so rebuilding it
  * on restore would either lose object state or leave stale buckets. Merge the
- * current cell and its immediate horizontal neighbors for the generated
- * list walk instead. The terrain-gated $BB:AAD4 compare remains authoritative,
- * and 21:9's maximum added reach is less than one 256-pixel cell per side. */
+ * current cell and every horizontal neighbor the widened placement interval
+ * can reach (up to two cells per side at 21:9 with spawn lead) for the
+ * generated list walk instead. The terrain-gated $BB:AAD4 compare remains
+ * authoritative. */
 uint16_t Dkc3PlacementScanBegin(uint16_t native_head,
                                 uint16_t native_cell_offset) {
-  uint16_t cell_offsets[3];
+  uint16_t cell_offsets[kDkc3VideoPlacementScanMaxCells];
   const uint16_t row_stride = Dkc3ReadWram16(0x15fa);
   const size_t cell_count = Dkc3VideoPlacementScanCells(
       native_cell_offset, row_stride, cell_offsets);
@@ -2153,37 +2154,34 @@ static void Dkc3ApplyBandPolicies(const Dkc3HdmaBand *band,
  * CMP #$0160 ($B7:A8C8) exactly like the eight variants the override
  * script widens in generated code, but the analysis leaves it to the
  * interpreter, which reads those immediates from the ROM image. Widen them
- * there: $30 by the configured margin and $160 by two margins, symmetric,
- * without the glide bias the generated wrappers apply (a cull only decides
- * whether a sprite reaches OAM, so a superset is harmless). Each write
- * checks the bytes it replaces, so an image that does not hold the native
- * or the previously widened operands is left alone.
+ * there using the same Dkc3VideoExpandSpriteCullLeft/Span policy (including
+ * terrain readiness, presentation bias, DKC3_CULL_WIDEN, and DKC3_SPAWN_LEAD).
+ * Each write checks the bytes it replaces, so an image that does not hold the
+ * native or the previously patched operands is left alone.
  */
 static void Dkc3PatchInterpreterCull(void) {
-  static int applied_extra = -1;
-  const int extra = Dkc3VideoExtra();
-  if (extra == applied_extra || !g_rom)
+  static uint16_t applied_left = 0x30u;
+  static uint16_t applied_span = 0x160u;
+  const uint16_t left = Dkc3VideoExpandSpriteCullLeft(0x30u);
+  const uint16_t span = Dkc3VideoExpandSpriteCullSpan(0x160u);
+  if ((left == applied_left && span == applied_span) || !g_rom)
     return;
   enum { kLeftOperand = 0x37a8c9u, kSpanOperand = 0x37a8ccu };
   const uint32_t rom_size = g_snes && g_snes->cart ? (uint32_t)g_snes->cart->romSize : 0;
   if (rom_size < kSpanOperand + 2u)
     return;
   uint8_t *rom = (uint8_t *)(uintptr_t)g_rom;
-  const unsigned previous = applied_extra < 0 ? 0u : (unsigned)applied_extra;
-  const uint16_t expect_left = (uint16_t)(0x30u + previous);
-  const uint16_t expect_span = (uint16_t)(0x160u + 2u * previous);
-  if (rom[kLeftOperand] != (expect_left & 0xffu) ||
-      rom[kLeftOperand + 1] != (expect_left >> 8) ||
-      rom[kSpanOperand] != (expect_span & 0xffu) ||
-      rom[kSpanOperand + 1] != (expect_span >> 8))
+  if (rom[kLeftOperand] != (applied_left & 0xffu) ||
+      rom[kLeftOperand + 1] != (applied_left >> 8) ||
+      rom[kSpanOperand] != (applied_span & 0xffu) ||
+      rom[kSpanOperand + 1] != (applied_span >> 8))
     return;
-  const uint16_t left = (uint16_t)(0x30u + (unsigned)extra);
-  const uint16_t span = (uint16_t)(0x160u + 2u * (unsigned)extra);
   rom[kLeftOperand] = (uint8_t)(left & 0xffu);
   rom[kLeftOperand + 1] = (uint8_t)(left >> 8);
   rom[kSpanOperand] = (uint8_t)(span & 0xffu);
   rom[kSpanOperand + 1] = (uint8_t)(span >> 8);
-  applied_extra = extra;
+  applied_left = left;
+  applied_span = span;
 }
 
 /* Floodlit Fish uses a full-screen inverted BG3 window for the water surface
@@ -2230,7 +2228,6 @@ static void Dkc3EnhanceUnderwaterSubscreen(Ppu *ppu, uint y, bool sub,
 }
 
 void Dkc3DrawPpuFrame(void) {
-  Dkc3PatchInterpreterCull();
   PpuSetWidescreenLineEnhancer(
       g_ppu, Dkc3VideoIsWidescreen() ? Dkc3EnhanceUnderwaterSubscreen : NULL,
       NULL);
@@ -2378,11 +2375,17 @@ void Dkc3DrawPpuFrame(void) {
                   g_ppu->bgmode, g_ppu->bgXsc,
                   g_ppu->screenEnabled[0], g_ppu->screenEnabled[1])
             : 0;
+    /* A mirrored margin at a level wall has no authored BG3 ring columns to
+     * expose. Within one margin of a wall, a physical 64-column BG3 repeats
+     * its rendered line like a bounded layer instead of reading the ring. */
+    if (Dkc3VideoMarginLeavesAuthoredExtent(camera_x, maximum_scroll_x))
+      physical_wide_mask = (uint8_t)(physical_wide_mask & ~0x04u);
     /* A bounded layer with a hardware window cannot repeat an already
      * composited 256-pixel line: Murky Mill's per-scanline BG3 light window
-     * then ends at the native edge and its clipped cone wraps to the opposite
-     * margin. Draw the 32-column map physically across the widened span so
-     * the same HDMA window edges are evaluated in screen space. */
+     * and Poisonous Pipeline's BG3 water-surface window would otherwise wrap
+     * their clipped spans into the opposite margin, including near a level
+     * wall. Draw the 32-column map physically across the widened span so the
+     * same HDMA window edges are evaluated in screen space. */
     physical_wide_mask = (uint8_t)(
         physical_wide_mask |
         (terrain_ready
@@ -2391,11 +2394,6 @@ void Dkc3DrawPpuFrame(void) {
                    g_ppu->screenEnabled[0], g_ppu->screenEnabled[1],
                    g_ppu->screenWindowed[0], g_ppu->screenWindowed[1])
              : 0));
-    /* A mirrored margin at a level wall has no authored BG3 ring columns to
-     * expose. Within one margin of a wall, a physical 64-column BG3 repeats
-     * its rendered line like a bounded layer instead of reading the ring. */
-    if (Dkc3VideoMarginLeavesAuthoredExtent(camera_x, maximum_scroll_x))
-      physical_wide_mask = (uint8_t)(physical_wide_mask & ~0x04u);
     const uint8_t repeat_exempt_mask = 0u;
     const uint8_t render_layer_mask =
         (uint8_t)(wide_layer_mask | physical_wide_mask);
@@ -2467,6 +2465,7 @@ void Dkc3DrawPpuFrame(void) {
     Dkc3ResetWidescreenShadow();
     PpuSetExtraSpace(g_ppu, 0);
   }
+  Dkc3PatchInterpreterCull();
 
   dma_startDma(g_dma, g_snesrecomp_last_hdmaen, true);
   for (int channel = 0; channel < 8; channel++) {

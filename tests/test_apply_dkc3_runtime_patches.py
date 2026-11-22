@@ -76,6 +76,15 @@ class RuntimePatches(unittest.TestCase):
         self.assertNotIn(
             "PpuDrawBackground_4bpp_opt(ppu, y, sub, 0, 0xc000, 0x8000);", ppu)
 
+    def test_ppu_windows_honors_combine_logic_and_presentation_bias(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            out = pathlib.Path(temporary)
+            patches.apply_directory(PATCHES, SNESRECOMP, out)
+            ppu = (out / "ppu.c").read_text()
+        self.assertIn("switch ((ppu->wbgobjlog >> (layer * 2)) & 3u)", ppu)
+        self.assertIn("if (ppu->wsPresentationXBias != 0)", ppu)
+        self.assertNotIn("  win->bits = w1_bits | w2_bits;\n  debug_server_on_ppu_window", ppu)
+
     def test_apu_diagnostic_predicates_precede_environment_lookup(self):
         with tempfile.TemporaryDirectory() as temporary:
             out = pathlib.Path(temporary)
@@ -95,6 +104,15 @@ class RuntimePatches(unittest.TestCase):
             for name in ("dsp.c", "dsp_shadow.c"):
                 text = (out / name).read_text()
                 self.assertNotIn("defined(SNESRECOMP_TRACE)", text, name)
+
+    def test_balanced_dispatch_unwinds_nonlocal_stack_pops(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            out = pathlib.Path(temporary)
+            patches.apply_directory(PATCHES, SNESRECOMP, out)
+            bridge = (out / "interp_bridge.c").read_text()
+        self.assertIn("const uint16_t run_s_exit = pre_s_above ? cpu->S : entry_s;", bridge)
+        self.assertIn("return interp_bridge_lle_yield_unwind(cpu, target_pc24 & 0xFFFFFFu);", bridge)
+        self.assertIn("return interp_bridge_lle_yield_unwind(cpu, post_return_pc);", bridge)
 
     def _apply_edited(self, edit):
         """Apply the patch set to a copy of the pinned runtime after `edit`."""

@@ -1930,3 +1930,279 @@ windowed 960x720 with the bar; View > Toggle Full Screen and the saved
 fullscreen preference both gave `GetMenu()` NULL and a `WS_POPUP` client
 equal to the monitor; the menu item and Escape restored the bar and
 960x720. All 28 CTest checks pass. No cartridge, widescreen or Mac change.
+
+## 2026-11-21 - widescreen enemy spawn and sprite-cull lead-in (16:9 Doorstop Dash)
+
+- **Symptom:** in 16:9 widescreen (specifically reported in Doorstop Dash,
+  level `$0028`), enemies and doors could still blink onto the screen past
+  the widened edge instead of walking or scrolling smoothly across it.
+- **Cause:** Doorstop Dash places all 118 objects through the standard
+  `$BB:A647` / `$BB:AAD4` / `$B7:8857` pipeline (90 placements on
+  `DATA_BBA8BE` row `$00` with `32 px` native slack, and 28 door/gear
+  placements on row `$10` with `16 px` native slack). The existing
+  widescreen helpers (`Dkc3VideoExpandCullLeft` / `Dkc3VideoExpandCullSpan`)
+  widened those windows by only the exact presented margin (`extra ± bias`)
+  with no extra lead-in. Because newly activated sprites require 2+ frames
+  for VRAM tile DMA upload inside the sprite renderer at `$B7:8857`
+  (`CODE_B78857`), which queues uploads at `$B7:90AA` (`CODE_B790AA`), and
+  `$B7:8925` culls sprites before reaching `CODE_B790AA`, fast sprint/roll
+  scrolling plus sprite half-widths consumed the 16-32 px slack before tiles
+  finished uploading. In addition, the interpreter-patched cull at `$B7:A88F`
+  (`Dkc3PatchInterpreterCull`) previously widened symmetrically without
+  `presentation_bias`.
+- **Change:**
+  - Added configurable widescreen spawn-ahead helpers in
+    `runner/dkc3_video.h` and `runner/dkc3_video.c`:
+    `Dkc3VideoSetSpawnLead`, `Dkc3VideoSpawnLead`,
+    `Dkc3VideoSpriteCullLead`, `Dkc3VideoExpandSpawnLeft`,
+    `Dkc3VideoExpandSpawnSpan`, `Dkc3VideoExpandSpriteCullLeft`, and
+    `Dkc3VideoExpandSpriteCullSpan` (default `48 px` per side, overridable
+    via `DKC3_SPAWN_LEAD`, clamped to `[0, 64]`).
+  - Expanded `Dkc3VideoPlacementScanCells` and `Dkc3PlacementScanBegin`
+    (`runner/dkc3_game.c`) to scan up to two 256-pixel neighbor buckets per
+    side (`kDkc3VideoPlacementScanMaxCells = 5`) whenever the worst-case
+    widened reach (`2 * extra + lead + 32 px` asymmetric row slack) can
+    cross a second 256-pixel cell boundary (e.g., 21:9 with spawn lead).
+  - Placement lead applies only to `DATA_BBA8BE` rows with `Lx < $60` and
+    `Wx < $1C0` (rows `$00`, `$10`, `$30`, `$40`, `$70`), preserving 8-pixel
+    spawn/despawn hysteresis while skipping already-wide rows (`$20`, `$50`,
+    `$60`) so `camera_x - Lx_widened` cannot underflow 16-bit unsigned
+    subtraction near `camera_x = $0100`.
+  - Sprite renderer cull lead is clamped to `160 - 2 * extra` (`108 px` cap
+    at 16:10, `74 px` cap at 16:9, `0 px` at 21:9) so off-screen sprites
+    can queue VRAM tile DMA early without wrapping nine-bit OAM X onto the
+    opposite margin.
+  - Wired `$BB:AAD4` to `Dkc3VideoExpandSpawnLeft/Span` and the nine `$B7`
+    sprite renderer cull sites to `Dkc3VideoExpandSpriteCullLeft/Span` in
+    `scripts/apply_dkc3_widescreen_overrides.py`, leaving `$B6:F186` and
+    the static banana/star grid renderer (`$B7:E8E0` / `$B7:E981`) on the
+    exact `Dkc3VideoExpandCull*` helpers. Updated `Dkc3PatchInterpreterCull`
+    in `runner/dkc3_game.c` to use `Dkc3VideoExpandSpriteCullLeft/Span`
+    after per-frame bias and terrain-readiness updates.
+  - Native 4:3, unproven terrain frames, and `DKC3_CULL_WIDEN=0` keep zero
+    lead and native windows.
+- **Unit tests (ROM-free):** `python -m unittest discover -s tests` (22/22,
+  including updated `test_apply_dkc3_widescreen_overrides.py`).
+- **Unverified:** this widened window change remains unverified until a
+  paired `DKC3_CULL_WIDEN=0` vs `1` A/B comparison (and 4:3 hash-parity
+  check) is captured and recorded; an informal live Windows Release check
+  in 16:9 Doorstop Dash observed reduced enemy edge pop-in, without a
+  paired `DKC3_CULL_WIDEN=0` baseline capture. Also unverified: C/CTest
+  (`test_dkc3_video`), macOS rebuild, and full-game traversal across 16:10,
+  16:9, and 21:9. Regenerating `generated/snesrecomp/` from a ROM is
+  required to pick up the updated generated-code wrappers.
+
+## 2026-11-21 - Pot Hole Panic / Tyrant Twin Tussle black screen, crash, and save corruption
+
+- **Symptom:** in Pot Hole Panic (level `$0045`) and Tyrant Twin Tussle
+  (level `$004B`), the window turned black (`INIDISP=$8F`), the game
+  eventually crashed with an off-rails runtime failure, and closing the
+  window during the black-screen hang could corrupt `saves/save.srm`.
+- **Root cause:** both levels contain the only two `PLA; JMP $F27D`
+  non-local child-sprite despawn sites in bank `$B6` (`CODE_B6B22E` at
+  `$B6:B234` in Pot Hole Panic and `CODE_B69D33` at `$B6:9D3F` in Tyrant
+  Twin Tussle). When a parent sprite despawns before its child sprite,
+  the interpreted sprite handler (`$B6:B228` / `$B6:9D19`) executes a
+  `JSR` that call-bounces into the compiled helper with `entry_s = $01FA,
+  hrv = 2`. The helper executes `PLA` (discarding its own 2-byte `JSR`
+  return frame so `cpu->S = $01FC > entry_s`), tail-calls `$B6:F27D`
+  (deleting the sprite via `$BB:8591`), and executes `$B6:F281: JML [$04F5]`
+  (sprite-loop continuation), which enters `interp_tier_dispatch_balanced`
+  with `cpu->S` already strictly shallower than `entry_s`.
+  - Previously, `interp_tier_dispatch_balanced` started a nested
+    `interp_bridge_run_ex2` anchored at the stale `s_exit = entry_s`
+    (`$01FA`). When the child was the highest active sprite slot (as
+    reproduced deterministically at host frame 759 / `snes_frame_counter=57800`
+    in 16:9 Pot Hole Panic with `SNESRECOMP_LLE_JUMP_BOUNCE=1` or `0`),
+    the nested run finished the sprite loop and executed `$BB:B9AF: RTL`,
+    popping the outer interpreter's `JSL $BB:85BB` frame (`$01FC -> $01FF`),
+    exited with `ok = 1`, got `cpu_resolve_post_return_skip($01FF) == -1`
+    (outer caller was the interpreter, not compiled `g_recomp_stack`), and
+    returned `RECOMP_RETURN_NORMAL`. The owning interpreter then resumed at
+    `$B6:B22A` with empty stack `S = $01FF`, executed `$BB:B9AF: RTL` a
+    second time, popped garbage `$A0:78C3` from `$0200..$0202`, ran
+    off-rails inside the HiROM SRAM window (`$A0:6000-$7FFF`) and WRAM
+    with `INIDISP=$8F` for ~388 frames (`frame 800..1187`), and finally
+    tripped `off-rails runtime failure at host frame 1188 resume=$8034b3`
+    (`rc=6`). Closing the black window before `g_fail` triggered caused
+    shutdown to persist the corrupted `g_sram` buffer to `saves/save.srm`.
+  - Even when a higher active sprite slot existed (observed on slot 7 with
+    slot 8 active), `$BB:B8EB`'s `PHA; PHA; RTL` trampoline for slot 8
+    landed at `in.sp = $01FC > s_exit ($01FA)`, causing the nested run to
+    exit prematurely, silently skipping slot 8 and resuming `$B6:B22A` on
+    the deleted sprite.
+- **Change (`cmake/runtime-patches/interp_bridge.hunks`):**
+  - In `interp_tier_dispatch_balanced` (`@@ balanced-goto-unwind-to-owner`),
+    when `cpu->S` is already strictly shallower than `entry_s`
+    (`pre_s_delta != 0 && pre_s_delta < 0x8000u`), unwind straight back to
+    the owning interpreter at `target_pc24 & 0xFFFFFFu` with live `cpu->S`
+    via `interp_bridge_lle_yield_unwind` whenever
+    `s_interp_bounce_owner_depth > 0`, `!cpu_interrupt_context_active()`,
+    and `cpu->S` has not crossed above `s_interp_owner_exit_s`.
+  - When falling through to `interp_bridge_run_ex2` (`@@ arrival-bounce-balanced-hrv`)
+    with `cpu->S` already shallower than `entry_s` (e.g., no owning
+    interpreter or `S` crossed above a nested interpreter's exit watermark),
+    anchor the nested run at `run_s_exit = cpu->S` with `s_run_hrv = 0`
+    rather than the stale `entry_s`.
+  - Added defense in depth in `interp_tier_dispatch_balanced`'s epilogue
+    (`@@ balanced-overpop-unwind-to-owner`): capture `post_return_pc` via
+    `interp_bridge_run_ex2` and, if a nested run returns `ok` with `cpu->S`
+    strictly above `expected_post_s` and no compiled ancestor matches
+    (`cpu_resolve_post_return_skip <= 0`), unwind to the owning interpreter
+    at `post_return_pc` instead of returning `RECOMP_RETURN_NORMAL`.
+  - Added ROM-free unit test `test_balanced_dispatch_unwinds_nonlocal_stack_pops`
+    in `tests/test_apply_dkc3_runtime_patches.py`.
+- **Verified (Windows x64 Release, private ROM):**
+  - ROM-free Python tests on this branch: `python -m unittest discover -s tests` (23/23).
+  - Full Windows Release build and 28/28 CTest suite (including
+    `supplied_rom_headless_boot` and all four Windows SDL aspect smoke
+    tests: 4:3, 16:10, 16:9, 21:9), plus Pot Hole Panic (2,000 frames,
+    all four aspects, `DKC3_CULL_WIDEN=0`, `SNESRECOMP_LLE_JUMP_BOUNCE=0`,
+    and `[ibr]` trace confirming clean `yield-unwind -> $B6F281 sp=$01FC`
+    on both crash and slot-skip cases), Tyrant Twin Tussle (2,000 frames
+    across all four aspects), and 600-frame boot runs (`4:3`, `16:9`) all
+    exited `rc=0` with `inidisp=$0f`.
+- **Unverified:** clean rebuild of `build-windows` directly on this
+  branch without the sibling widescreen-lead changes, live triggering of
+  the `$B6:9D3F` despawn branch inside Tyrant Twin Tussle (proven
+  statically to execute the identical `PLA; JMP $F27D -> $B6:F281`
+  sequence as `$B6:B234`), full playthrough of both stages to the
+  flagpole, and macOS rebuild.
+
+## Poisonous Pipeline (`$003F`) — PPU window logic, widescreen window alignment, and Koco wall-exit investigation
+
+- **Reported symptoms:**
+  1. The pink water-surface pattern rendered far below the actual water
+     surface (and inverted over the rock walls at water shafts).
+  2. Fish ("odd fish movements") swimming into/through solid walls.
+- **Root cause 1 — Water surface patterns (three distinct bugs, all fixed):**
+  - **Missing `WBGLOG`/`WOBJLOG` combine logic in `PpuWindows_CalcWithExtra`
+    (`snesrecomp/runner/src/snes/ppu.c:605`):** Poisonous Pipeline renders
+    its pink water surface on BG3 (`bgXsc[2]=$70`, 32x32 tiles wrapping
+    vertically every 256 px) with `W34SEL=$0A` (W1 and W2 enabled,
+    non-inverted), `WBGLOG=$30` (`XNOR` for BG3), `TMW=TSW=$04`,
+    `W2=[255, 0]` (always empty), and `W1=[shaft_left, shaft_right]` at
+    water shafts or `W1=[255, 0]` deeper underwater. `PpuWindows_CalcWithExtra`
+    ignored `ppu->wbgobjlog` and hardcoded `win->bits = w1_bits | w2_bits`
+    (`OR`). Deep underwater (`W1=W2=[255,0]`), `OR(false, false) = false`
+    left BG3 unmasked everywhere, exposing its 256 px / 512 px vertical
+    wrap on the pipe floor; at water shafts, `OR(in_w1, false) = in_w1`
+    inverted the mask, hiding the surface inside the shaft and drawing it
+    over the surrounding walls.
+  - **Unshifted hardware windows under `wsPresentationXBias`
+    (`PpuWindows_CalcWithExtra`):** Near level walls (e.g. Poisonous
+    Pipeline's entrance shaft with `bias=+36`), `Dkc3DrawPpuFrame` shifts
+    BG `hScroll` and OBJ presentation left by `bias` pixels, but
+    `PpuWindows_CalcWithExtra` left non-pinned hardware window edges at
+    native screen X, misaligning the water-surface window by `bias` pixels.
+  - **Wall-extent BG3 clear overriding windowed 32-column BG3
+    (`runner/dkc3_game.c`):** `Dkc3VideoMarginLeavesAuthoredExtent(...)`
+    cleared bit `0x04` of `physical_wide_mask` *after* ORing
+    `Dkc3VideoPhysicalWindowedLayerMask(...)` instead of only clearing the
+    64-column BG3 ring bit from `Dkc3VideoPhysicalWideLayerMask(...)`.
+    Near the west wall, that forced Poisonous Pipeline's windowed 32-column
+    BG3 into `wsLayerRepeat`, wrapping the entrance-shaft water surface
+    into the opposite margin.
+- **Root cause 2 — Fish swimming through walls (original SNES behavior +
+  widescreen exposure; no recompiler/CPU bug):**
+  - Decoded all 109 placements of `$003F` (`$FE:4CEE` via `$FF:0040 + type`)
+    against the decompressed 96x80 metatile map (`$7F:0000`). All 40 fish
+    in the stage are Kocos (`$B6:8220`, `sid=$0300`): 12 patrolling Kocos
+    (`w_5a=$07 -> $B9:E1DB`, all patrol ranges inside open pipe chambers)
+    and 28 straight-swimming green Kocos (`w_5a=$08 -> $B9:E20D`:
+    `JSR $EE6E; JSR $E0EC; JMP $E183`, constant horizontal speed with
+    vertical bobbing and **no terrain/wall collision in the SNES ROM**).
+  - Audited `koco_main_idle` (already executes in authoritative LLE),
+    `recomp/bankb9.cfg`, and generated bank `$B9` movement functions, and
+    verified identical Koco `(x, y)` coordinates in 4:3 AOT vs 4:3 LLE
+    (`SNESRECOMP_LLE_BOUNCE=0`).
+  - Even on authentic 4:3 LLE, straight-swimming Koco `#7` (`$5C0, $240`,
+    `type=$02B8`) swims straight into the sloped ceiling if the player
+    pauses to watch. In 16:9 / 21:9, widened side margins and widened
+    `$BB:AAD4` activation/despawn (`+43 px` in 16:9, `+95 px` in 21:9)
+    spawn straight-swimming Kocos earlier and keep them visible further
+    past the native 256 px edges, visibly exposing their straight-line
+    wall exits. Per the cartridge correctness oracle, Koco physics were
+    left authentic.
+- **Changes:**
+  - `cmake/runtime-patches/ppu.hunks`: added fail-closed hunks
+    `@@ window-combine-logic` (honors `(ppu->wbgobjlog >> (layer * 2)) & 3u`
+    for OR/AND/XOR/XNOR across all 6 window layers and masks unused upper
+    bits by `(1u << nr) - 1u`, matching `ppu_legacy.c`) and
+    `@@ window-presentation-bias` (shifts non-pinned edges of non-empty
+    W1/W2 windows by `-ppu->wsPresentationXBias`, clamped to
+    `[win->edges[0], window_right - 1]`; exact no-op when bias is 0).
+  - `runner/dkc3_game.c`: moved the `Dkc3VideoMarginLeavesAuthoredExtent`
+    BG3-ring bit clear before ORing `Dkc3VideoPhysicalWindowedLayerMask`.
+  - `tests/test_dkc3_ppu_windows.c`, `CMakeLists.txt`, and
+    `tests/test_apply_dkc3_runtime_patches.py`: added 247 ROM-free PPU
+    window cases (216 BG3 + 24 OBJ/Color Window oracle comparisons against
+    `ppu_legacy.c` and 7 widescreen presentation-X-bias checks) plus
+    runtime-patch hunk assertions.
+- **Verified (Windows x64 Release, private ROM):**
+  - `python -m unittest discover -s tests`: 23/23 passed on this branch.
+  - Full Windows Release build and 29/29 CTest suite (including
+    `dkc3_ppu_windows`, `dkc3_ppu_mode2`, `supplied_rom_headless_boot`,
+    and all four Windows SDL aspect smoke tests: 4:3, 16:10, 16:9, 21:9).
+  - Poisonous Pipeline (`$003F`, 1,310-frame swim replay through entrance
+    shaft, deep underwater, and second shaft):
+    - **4:3 fast PPU vs `DKC3_PPU_LEGACY=1`:** 107/107 sampled frames
+      (frames 240–1300 step 10) are **byte-for-byte identical (0 diffs)**;
+      `audio_fnv1a=451a775a3b3b4f8f`.
+    - **16:9 and 21:9 visual inspection:** entrance shaft (`bias=+36`),
+      deep underwater (frames 700, 850), right-margin shaft entry (frames
+      1015–1070), and second shaft (frames 1150, 1300) all render with
+      aligned water surfaces, zero wrapped patterns deep underwater, and
+      zero opposite-margin repeat leaks.
+- **Unverified:** full playthrough of Poisonous Pipeline to the flagpole
+  (including the second sub-room), Murky Mill / Floodlit Fish live visual
+  regression captures, and macOS rebuild.
+
+## 2026-11-21 - missing bonus stars near the left wall in widescreen (issue #4)
+
+- **Symptom:** in Doorstop Dash's first bonus round ("Collect the Stars!",
+  60 stars, level `$52`), one star was missing and uncollectible in 16:9
+  widescreen, while 4:3 completed normally.
+- **Cause:** DKC3's "Collect the Stars!" bonus games store their stars in
+  the same `$7E:6780` static tile-row list as banana formations, initialized
+  by `$B7:E4B7` and walked every frame by `$B7:E8E0`. For each active group,
+  `$B7:E8E0` calls both the renderer (`$B7:E981`) and the collector
+  (`$B7:EB69`). The walk computes `$2C = camera_x + right` (`$B7:E8E4`,
+  native `$0100`), subtracts `$2C` from the group's left X (`$B7:E905`),
+  adds the group's width (`$B7:E909`), and adds back a span constant
+  (`$B7:E90D`, native `$010F`), skipping both drawing and collection on
+  `BMI` (`$B7:E910`). Because `$B7:E8E4` widens `$0100` with
+  `Dkc3VideoExpandCullRight` (`+ extra + bias`), `$B7:E90D` must widen
+  `$010F` by both margins (`Dkc3VideoExpandCullSpan`, `+ 2 * extra`) so the
+  left cutoff stays at `camera_x - ($0F + extra - bias)`, matching
+  `$B7:E9C8`. `scripts/apply_dkc3_widescreen_overrides.py` instead wrapped
+  `0x10f` in `Dkc3VideoExpandCullLeft` (`+ extra - bias`), so `extra`
+  canceled out and the left cutoff moved to `camera_x - 15 + 2 * bias`:
+  with `bias = 0` the left margin was never widened, and near a left wall
+  with positive glide/shift bias (`+43` in 16:9, `+95` in 21:9) the cutoff
+  moved inside the native viewport (up to `camera_x + 71` in 16:9 and
+  `camera_x + 175` in 21:9). In Doorstop Dash Bonus 1 (map shape 4), entry 0
+  is a single-star group spanning world X `$0148..$0150` (`328..336`), so
+  near the left wall in 16:9 its right edge falls below the shifted cutoff
+  and it is skipped for both drawing and collection.
+- **Fix:** `adapt_grid_renderer` in
+  `scripts/apply_dkc3_widescreen_overrides.py` now wraps `0x10f` in block
+  `0xB7E909` with `Dkc3VideoExpandCullSpan`. Because
+  `Dkc3VideoExpandCullSpan(0x10f) - Dkc3VideoExpandCullRight(0x100)` equals
+  `Dkc3VideoExpandCullLeft(0x0f)` for every aspect ratio, presentation bias,
+  terrain-ready state, and `DKC3_CULL_WIDEN=0`, the walk and draw bounds
+  agree everywhere and 4:3 stays native. Updated
+  `tests/test_apply_dkc3_widescreen_overrides.py` and added the
+  `Span(0x10f) - Right(0x100) == Left(0x0f)` invariant checks across
+  positive, zero, and negative presentation bias in `tests/test_dkc3_video.c`.
+- **Verified:** `tests/test_apply_dkc3_widescreen_overrides.py` (4/4),
+  ROM-backed Windows Release regeneration and build, all 28 CTest checks
+  (including `dkc3_video`'s new `Span(0x10f) - Right(0x100) == Left(0x0f)`
+  checks), and live in-game verification in Doorstop Dash Bonus Level 1
+  ("Collect the Stars!", 60 stars) in widescreen confirming the previously
+  missing star now appears and is collectible.
+- **Unverified:** macOS rebuild, headless 4:3/wide hash-parity capture of
+  Doorstop Dash Bonus 1 with `DKC3_CULL_WIDEN=0` vs `1`, and traversal of
+  every other "Collect the Stars!" bonus level across 16:10, 16:9, and 21:9.
+  Regenerating generated C from a ROM is required to pick up the override
+  change in a compiled binary.
