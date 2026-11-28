@@ -14,6 +14,7 @@
 
 #include "dkc3_game.h"
 #include "dkc3_haptics.h"
+#include "dkc3_kong_tracker.h"
 #include "dkc3_video.h"
 #include "diagnostics.h"
 #include "desktop_filter.h"
@@ -55,6 +56,7 @@
 #include "windows_menu.h"
 #define DKC3_MKDIR(path) _mkdir(path)
 #else
+#include <unistd.h>
 #define DKC3_MKDIR(path) mkdir(path, 0755)
 #endif
 
@@ -239,6 +241,41 @@ static bool EnsureSaveDirectory(void) {
   if (DKC3_MKDIR("saves") == 0) return true;
   return errno == EEXIST;
 }
+
+#ifndef __APPLE__
+/* DKC3_USER_DIR gives automation an isolated directory for config, quick
+ * states and SRAM; otherwise they stay beside the executable. Launcher assets
+ * are still read from the executable directory. The directory's parent must
+ * already exist. */
+static bool PrepareRuntimeDirectory(char *assets_path, size_t capacity) {
+  const char *user_dir = getenv("DKC3_USER_DIR");
+  if (!user_dir || !*user_dir) {
+    (void)snesrecomp_anchor_to_exe_dir();
+    return true;
+  }
+  /* A relative "assets" would resolve under DKC3_USER_DIR after the chdir
+   * below, so an unresolvable executable directory fails closed. */
+  if (!snesrecomp_exe_dir_path("assets", assets_path, capacity)) {
+    fprintf(stderr,
+            "Unable to resolve the executable directory for DKC3_USER_DIR\n");
+    return false;
+  }
+  if (DKC3_MKDIR(user_dir) != 0 && errno != EEXIST) {
+    fprintf(stderr, "Unable to create DKC3_USER_DIR '%s'\n", user_dir);
+    return false;
+  }
+#ifdef _WIN32
+  if (_chdir(user_dir) != 0) {
+#else
+  if (chdir(user_dir) != 0) {
+#endif
+    fprintf(stderr, "Unable to enter DKC3_USER_DIR '%s'\n", user_dir);
+    return false;
+  }
+  fprintf(stdout, "User data: %s\n", user_dir);
+  return true;
+}
+#endif
 
 static void ShowError(const char *message) {
   fprintf(stderr, "%s\n", message ? message : "Unknown error");
@@ -1027,6 +1064,11 @@ static void ApplyOverlaySettings(SdlHost *host,
          sizeof host->player_key_bind);
   memcpy(host->player_pad_bind, updated.player_pad_bind,
          sizeof host->player_pad_bind);
+  Dkc3KongSetBadgesVisible(Dkc3LauncherKongBadges() != 0);
+  Dkc3SetPauseCrateSpawnEnabled(updated.assist_tools != 0 &&
+                                Dkc3LauncherPauseCrateSpawn() != 0);
+  Dkc3SetShowHiddenObjectsEnabled(updated.assist_tools != 0 &&
+                                  Dkc3LauncherShowHiddenObjects() != 0);
   memcpy(host->assist_key_bind, updated.assist_key_bind,
          sizeof host->assist_key_bind);
   memcpy(host->assist_pad_bind, updated.assist_pad_bind,
@@ -1174,9 +1216,23 @@ static int RunGame(const char *rom_path,
     return 3;
   }
   if (sram_enabled) {
-    if (EnsureSaveDirectory()) RtlReadSram();
-    else sram_enabled = false;
+    if (EnsureSaveDirectory()) {
+      RtlReadSram();
+      (void)Dkc3KongTrackingEnable("saves/kong_letters.dat");
+      /* The Settings checkbox, unless DKC3_KONG_BADGES overrides it (and is
+       * then remembered, as DKC3_HAPTICS is). */
+      if (getenv("DKC3_KONG_BADGES"))
+        Dkc3LauncherSetKongBadges(
+            Dkc3KongBadgesEnabledFromEnv(getenv("DKC3_KONG_BADGES")));
+      Dkc3KongSetBadgesVisible(Dkc3LauncherKongBadges() != 0);
+    } else {
+      sram_enabled = false;
+    }
   }
+  Dkc3SetPauseCrateSpawnEnabled(settings->assist_tools != 0 &&
+                                Dkc3LauncherPauseCrateSpawn() != 0);
+  Dkc3SetShowHiddenObjectsEnabled(settings->assist_tools != 0 &&
+                                  Dkc3LauncherShowHiddenObjects() != 0);
   if (!Dkc3DesktopColorFilterInit(&host.color_filter, screen_filter)) {
     free(rom);
 #ifdef __APPLE__
@@ -1807,6 +1863,9 @@ static int RunGame(const char *rom_path,
       const uint8_t *present_pixels = Dkc3DesktopColorFilterApply(
           &host.color_filter, host.pixels, host.filtered_pixels,
           Dkc3VideoPixelCount());
+      /* Set before arming the capture: a banner moves presentation off
+       * Metal, so both decisions must see the same state. */
+      Dkc3DesktopOverlaySetPauseBanner(host.overlay, Dkc3PauseCrateHudLabel());
       /* DKC3_DESKTOP_SCREENSHOT: capture the presented drawable (after the
        * upscaler and screen model, before the overlay is composited over it
        * is not possible, so the overlay should be closed) at frame
@@ -1820,7 +1879,8 @@ static int RunGame(const char *rom_path,
           screenshot_rgb = (uint8_t *)malloc((size_t)dw * (size_t)dh * 3u);
           if (screenshot_rgb) {
 #ifdef __APPLE__
-            if (metal_presenter && !overlay_open) {
+            if (metal_presenter && !overlay_open &&
+                !Dkc3DesktopOverlayHasPauseBanner(host.overlay)) {
               Dkc3MacMetalPresenterArmCapture(screenshot_rgb, dw, dh);
               host.presenter.capture_width = dw;
               host.presenter.capture_height = dh;
@@ -1838,7 +1898,8 @@ static int RunGame(const char *rom_path,
         break;
       }
 #ifdef __APPLE__
-      if (metal_presenter && !overlay_open) {
+      if (metal_presenter && !overlay_open &&
+          !Dkc3DesktopOverlayHasPauseBanner(host.overlay)) {
         /* The Metal view shows the game; the OpenGL swap and its
          * WindowServer round trip are skipped entirely. */
         Dkc3MacMetalPresenterSetVisible(true);
@@ -2035,7 +2096,9 @@ int main(int argc, char **argv) {
   }
   Dkc3LauncherSetAssetsPath(assets_path);
 #else
-  (void)snesrecomp_anchor_to_exe_dir();
+  char assets_path[kPathCapacity] = {0};
+  if (!PrepareRuntimeDirectory(assets_path, sizeof assets_path)) return 2;
+  if (assets_path[0]) Dkc3LauncherSetAssetsPath(assets_path);
 #endif
   if (!Dkc3DiagnosticsInit("sdl2", DKC3_RELEASE_VERSION))
     fprintf(stderr, "warning: diagnostics could not be initialized\n");
